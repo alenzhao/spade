@@ -1,5 +1,7 @@
 \name{SPADE.addDensityToFCS}
 \alias{SPADE.addDensityToFCS}
+\alias{SPADE.transform.FCS}
+\alias{SPADE.density}
 \title{
 Annotate FCS file with local density of each observation
 }
