@@ -1,7 +1,7 @@
 # Helper functions
 
 SPADE.strip.sep <- function(name) {
-    ifelse(substr(name,nchar(name),nchar(name))==.Platform$file,substr(name,1,nchar(name)-1),name)
+	ifelse(substr(name,nchar(name),nchar(name))==.Platform$file,substr(name,1,nchar(name)-1),name)
 }
 
 SPADE.normalize.out_dir <- function(out_dir) {
@@ -62,13 +62,15 @@ SPADE.driver <- function(
 	comp=TRUE, 
 	arcsinh_cofactor=NULL,   # deprecated 
 	transforms=flowCore::arcsinhTransform(a=0, b=0.2),
-	downsampling_samples=20000, 
+	downsampling_target_number=NULL, 
+	downsampling_target_pctile=NULL,
+	downsampling_target_percent=0.1,
 	downsampling_exclude_pctile=0.01, 
-	downsampling_target_pctile=0.05, 
 	k=200, 
 	clustering_samples=50000, 
-	layout=igraph0:::layout.kamada.kawai, 
-	pctile_color=c(0.02,0.98)
+	layout=igraph:::layout.kamada.kawai, 
+	pctile_color=c(0.02,0.98),
+	fcs_channel_mappings_json=NULL
 ) {
 
 	if (length(files) == 1 && file.info(files)$isdir) {
@@ -98,6 +100,11 @@ SPADE.driver <- function(
 		transforms <- flowCore::arcsinhTransform(a=0, b=1/arcsinh_cofactor)
 	}
 
+	# Strip any existing cluster and density columns from files
+	for (f in files) {
+		SPADE.removeExistingDensityAndClusterColumns(f)
+	}
+
 	# Run downsampling/clustering/upsampling on all specified files 
 	density_files <- c()
 	sampled_files <- c()
@@ -107,10 +114,12 @@ SPADE.driver <- function(
 		f_sampled <- paste(out_dir,basename(f),".downsample.fcs",sep="")
 
 		SPADE.addDensityToFCS(f, f_density, cols=cluster_cols, comp=comp, transforms=transforms)
-		SPADE.downsampleFCS(f_density, f_sampled, 
+		SPADE.downsampleFCS(f_density,
+							f_sampled, 
 							exclude_pctile=downsampling_exclude_pctile,
 							target_pctile=downsampling_target_pctile,
-							desired_samples=downsampling_samples)
+							target_number=downsampling_target_number,
+							target_percent=downsampling_target_percent)
 
 		density_files <- c(density_files, f_density)
 		sampled_files <- c(sampled_files, f_sampled)	
@@ -166,23 +175,22 @@ SPADE.driver <- function(
 			# Compute the median marker intensities in each node, including the overall cell frequency per node	
 			message("Computing medians for file: ",f)
 			anno <- SPADE.markerMedians(f, vcount(graph), cols=p$median_cols, transforms=transforms, cluster_cols=cluster_cols, comp=comp)
-					
 			if (!is.null(reference_medians)) {	# If a reference file is specified								
 				# Compute the fold change compared to reference medians
-				message("Computing fold change for file: ",f)
+				message("Computing fold change for file: ", f)
 				fold_anno <- SPADE.markerMedians(f, vcount(graph), cols=p$fold_cols, transforms=transforms, cluster_cols=cluster_cols, comp=comp)
 				fold <- fold_anno$medians - reference_medians$medians
+				raw_fold <- fold_anno$raw_medians / reference_medians$raw_medians
 				
 				ratio <- log10(fold_anno$percenttotal / reference_medians$percenttotal); 
 				colnames(ratio) <- c("percenttotalratiolog")
 				is.na(ratio) <- fold_anno$count == 0 | reference_medians$count == 0
 
 				# Merge the fold-change columns with the count, frequency, and median columns
-				anno <- c(anno, list(percenttotalratiolog = ratio, fold = fold))	
+				anno <- c(anno, list(percenttotalratiolog = ratio, fold = fold, raw_fold=raw_fold))	
 			}
 
 			SPADE.write.graph(SPADE.annotateGraph(graph, layout=layout_table, anno=anno), paste(f,".medians.gml",sep=""), format="gml")
-
 			# We save an R native version of the annotations to simpify plotting, and other downstream operations
 			anno <- SPADE.flattenAnnotations(anno)
 			for (c in colnames(anno)) { attr_values[[c]] <- c(attr_values[[c]], anno[,c]) }
@@ -195,6 +203,82 @@ SPADE.driver <- function(
 	rownames(attr_ranges) <- sapply(rownames(attr_ranges), function(x) { gsub("[^A-Za-z0-9_]","",x) })
 	write.table(attr_ranges, paste(out_dir,"global_boundaries.table",sep=""), col.names=FALSE)
 
+	# Evaluate population rules if mapping provided
+	ruleDir = system.file(paste("tools","PopulationRules","",sep=.Platform$file.sep),package="spade")
+	
+	if (!is.null(fcs_channel_mappings_json)) {
+		library("rjson")
+		library("hash")
+		fcs_channel_mapping=fromJSON(fcs_channel_mappings_json)
+		cat("Evaluating Population Rules....\n")
+		#Ketaki: Is this correct? Look at only one fcs file. The channel ordering should be the same across all fcs files.
+		population_rule_mappings = SPADE.createPopulationMapping(sampled_files[1], ruleDir, fcs_channel_mapping)
+		for (filename in names(population_rule_mappings)) {
+			for (sampled_file in sampled_files) {
+				cat(paste("Rule:",filename,"\n",sep=" "))
+				message("Evaluating population rule: ", filename, " for file: ", sampled_file)
+				SPADE.evaluateCellTypeRule(out_dir,sampled_file,ruleCols=population_rule_mappings[[filename]],ruleDir=ruleDir,ruleFile=filename)     
+			}
+		}
+	}
+
+	### Produce statistics tables ###
+	message("Producing tables...")
+	dir.create(paste(out_dir,'tables',sep='/'),recursive=TRUE,showWarnings=FALSE)
+	# Find the files
+	files <- dir(out_dir,full.names=TRUE,pattern=glob2rx("*.anno.Rsave"))
+	# Find all the params
+	params <- unique(as.vector(sapply(files, function(f) { load(f); colnames(anno); })))
+
+	# Transposition 1: Rows are nodes, cols are files, files are params
+	dir.create(paste(out_dir,'tables','byAttribute',sep='/'),recursive=TRUE,showWarnings=FALSE)
+	for (p in params) {
+		pivot <- c()
+		names <- c()
+		for (f in files){
+			load(f)
+			f = basename(f)
+			if (p %in% colnames(anno)) {
+				pivot <- cbind(pivot, anno[,p])
+				names <- c(names, f)
+			}
+		}
+		names <- gsub("[[:alnum:][:punct:]]+/output/([[:alnum:][:punct:]]+).fcs.density.fcs.cluster.fcs.anno.Rsave", "\\1", names);
+		pivot <- cbind(1:nrow(pivot),pivot)
+		colnames(pivot) <- c("name", names)
+		if (!is.null(pivot) && ncol(pivot) > 0) {
+			write.csv(pivot, file=paste(out_dir,'tables/byAttribute/',p,'_table','.csv',sep=''), row.names=FALSE)
+		}
+	}
+
+	byNodeData = list()
+	# Transposition 2: Rows are nodes, cols are params, files are files
+	dir.create(paste(out_dir,'tables','bySample',sep='/'),recursive=TRUE,showWarnings=FALSE)
+	for (f in files) {
+		load(f)
+		f = basename(f)
+		pivot <- anno
+		names <- colnames(pivot)
+		pivot <- cbind(1:nrow(pivot),pivot)
+		colnames(pivot) <- c("ID", names)
+		name <- gsub("output/([[:alnum:][:punct:]]+).fcs.density.fcs.cluster.fcs.anno.Rsave", "\\1", f)
+		write.csv(pivot, file=paste(out_dir,'tables/bySample/',name,'_table','.csv',sep=''), row.names=FALSE)
+	}
+
+	# Transposition 3: Rows are params, cols are files, files are nodes
+	dir.create(paste(out_dir,'tables','byNodeID',sep='/'),recursive=TRUE,showWarnings=FALSE)
+	for (node in rownames(pivot)){
+		tableData = list()
+		for (f in files){
+			load(f)
+			f = basename(f)
+			tableData[[f]]= unlist(anno[node,,drop=T])
+		}
+		tableData = do.call("cbind",tableData)
+		write.csv(tableData, file=paste(out_dir,'tables/byNodeId/',node,'_table','.csv',sep=''), row.names=TRUE,quote=F)  
+	}
+
+	
 	invisible(NULL)
 }
 
@@ -204,203 +288,203 @@ SPADE.driver <- function(
 
 cnvrt.coords <- function(x,y=NULL,input=c('usr','plt','fig','dev','tdev')) {
 
-  input <- match.arg(input)
-  xy <- xy.coords(x,y, recycle=TRUE)
+	input <- match.arg(input)
+	xy <- xy.coords(x,y, recycle=TRUE)
 
-  cusr <- par('usr')
-  cplt <- par('plt')
-  cfig <- par('fig')
-  cdin <- par('din')
-  comi <- par('omi')
-  cdev <- c(comi[2]/cdin[1],(cdin[1]-comi[4])/cdin[1],
-            comi[1]/cdin[2],(cdin[2]-comi[3])/cdin[2])
+	cusr <- par('usr')
+	cplt <- par('plt')
+	cfig <- par('fig')
+	cdin <- par('din')
+	comi <- par('omi')
+	cdev <- c(comi[2]/cdin[1],(cdin[1]-comi[4])/cdin[1],
+			comi[1]/cdin[2],(cdin[2]-comi[3])/cdin[2])
 
-  if(input=='usr'){
-    usr <- xy
+	if(input=='usr'){
+		usr <- xy
 
-    plt <- list()
-    plt$x <- (xy$x-cusr[1])/(cusr[2]-cusr[1])
-    plt$y <- (xy$y-cusr[3])/(cusr[4]-cusr[3])
+		plt <- list()
+		plt$x <- (xy$x-cusr[1])/(cusr[2]-cusr[1])
+		plt$y <- (xy$y-cusr[3])/(cusr[4]-cusr[3])
 
-    fig <- list()
-    fig$x <- plt$x*(cplt[2]-cplt[1])+cplt[1]
-    fig$y <- plt$y*(cplt[4]-cplt[3])+cplt[3]
+		fig <- list()
+		fig$x <- plt$x*(cplt[2]-cplt[1])+cplt[1]
+		fig$y <- plt$y*(cplt[4]-cplt[3])+cplt[3]
 
-    dev <- list()
-    dev$x <- fig$x*(cfig[2]-cfig[1])+cfig[1]
-    dev$y <- fig$y*(cfig[4]-cfig[3])+cfig[3]
+		dev <- list()
+		dev$x <- fig$x*(cfig[2]-cfig[1])+cfig[1]
+		dev$y <- fig$y*(cfig[4]-cfig[3])+cfig[3]
 
-    tdev <- list()
-    tdev$x <- dev$x*(cdev[2]-cdev[1])+cdev[1]
-    tdev$y <- dev$y*(cdev[4]-cdev[3])+cdev[3]
+		tdev <- list()
+		tdev$x <- dev$x*(cdev[2]-cdev[1])+cdev[1]
+		tdev$y <- dev$y*(cdev[4]-cdev[3])+cdev[3]
 
-    return( list( usr=usr, plt=plt, fig=fig, dev=dev, tdev=tdev ) )
-  }
+		return( list( usr=usr, plt=plt, fig=fig, dev=dev, tdev=tdev ) )
+	}
 
-  if(input=='plt') {
+	if(input=='plt') {
 
-    plt <- xy
+		plt <- xy
 
-    usr <- list()
-    usr$x <- plt$x*(cusr[2]-cusr[1])+cusr[1]
-    usr$y <- plt$y*(cusr[4]-cusr[3])+cusr[3]
+		usr <- list()
+		usr$x <- plt$x*(cusr[2]-cusr[1])+cusr[1]
+		usr$y <- plt$y*(cusr[4]-cusr[3])+cusr[3]
 
-    fig <- list()
-    fig$x <- plt$x*(cplt[2]-cplt[1])+cplt[1]
-    fig$y <- plt$y*(cplt[4]-cplt[3])+cplt[3]
+		fig <- list()
+		fig$x <- plt$x*(cplt[2]-cplt[1])+cplt[1]
+		fig$y <- plt$y*(cplt[4]-cplt[3])+cplt[3]
 
-    dev <- list()
-    dev$x <- fig$x*(cfig[2]-cfig[1])+cfig[1]
-    dev$y <- fig$y*(cfig[4]-cfig[3])+cfig[3]
+		dev <- list()
+		dev$x <- fig$x*(cfig[2]-cfig[1])+cfig[1]
+		dev$y <- fig$y*(cfig[4]-cfig[3])+cfig[3]
 
-    tdev <- list()
-    tdev$x <- dev$x*(cdev[2]-cdev[1])+cdev[1]
-    tdev$y <- dev$y*(cdev[4]-cdev[3])+cdev[3]
+		tdev <- list()
+		tdev$x <- dev$x*(cdev[2]-cdev[1])+cdev[1]
+		tdev$y <- dev$y*(cdev[4]-cdev[3])+cdev[3]
 
-    return( list( usr=usr, plt=plt, fig=fig, dev=dev, tdev=tdev ) )
-  }
+		return( list( usr=usr, plt=plt, fig=fig, dev=dev, tdev=tdev ) )
+	}
 
-  if(input=='fig') {
+	if(input=='fig') {
 
-    fig <- xy
+		fig <- xy
 
-    plt <- list()
-    plt$x <- (fig$x-cplt[1])/(cplt[2]-cplt[1])
-    plt$y <- (fig$y-cplt[3])/(cplt[4]-cplt[3])
+		plt <- list()
+		plt$x <- (fig$x-cplt[1])/(cplt[2]-cplt[1])
+		plt$y <- (fig$y-cplt[3])/(cplt[4]-cplt[3])
 
-    usr <- list()
-    usr$x <- plt$x*(cusr[2]-cusr[1])+cusr[1]
-    usr$y <- plt$y*(cusr[4]-cusr[3])+cusr[3]
+		usr <- list()
+		usr$x <- plt$x*(cusr[2]-cusr[1])+cusr[1]
+		usr$y <- plt$y*(cusr[4]-cusr[3])+cusr[3]
 
-    dev <- list()
-    dev$x <- fig$x*(cfig[2]-cfig[1])+cfig[1]
-    dev$y <- fig$y*(cfig[4]-cfig[3])+cfig[3]
+		dev <- list()
+		dev$x <- fig$x*(cfig[2]-cfig[1])+cfig[1]
+		dev$y <- fig$y*(cfig[4]-cfig[3])+cfig[3]
 
-    tdev <- list()
-    tdev$x <- dev$x*(cdev[2]-cdev[1])+cdev[1]
-    tdev$y <- dev$y*(cdev[4]-cdev[3])+cdev[3]
+		tdev <- list()
+		tdev$x <- dev$x*(cdev[2]-cdev[1])+cdev[1]
+		tdev$y <- dev$y*(cdev[4]-cdev[3])+cdev[3]
 
-    return( list( usr=usr, plt=plt, fig=fig, dev=dev, tdev=tdev ) )
-  }
+		return( list( usr=usr, plt=plt, fig=fig, dev=dev, tdev=tdev ) )
+	}
 
-  if(input=='dev'){
-    dev <- xy
+	if(input=='dev'){
+		dev <- xy
 
-    fig <- list()
-    fig$x <- (dev$x-cfig[1])/(cfig[2]-cfig[1])
-    fig$y <- (dev$y-cfig[3])/(cfig[4]-cfig[3])
+		fig <- list()
+		fig$x <- (dev$x-cfig[1])/(cfig[2]-cfig[1])
+		fig$y <- (dev$y-cfig[3])/(cfig[4]-cfig[3])
 
-    plt <- list()
-    plt$x <- (fig$x-cplt[1])/(cplt[2]-cplt[1])
-    plt$y <- (fig$y-cplt[3])/(cplt[4]-cplt[3])
+		plt <- list()
+		plt$x <- (fig$x-cplt[1])/(cplt[2]-cplt[1])
+		plt$y <- (fig$y-cplt[3])/(cplt[4]-cplt[3])
 
-    usr <- list()
-    usr$x <- plt$x*(cusr[2]-cusr[1])+cusr[1]
-    usr$y <- plt$y*(cusr[4]-cusr[3])+cusr[3]
+		usr <- list()
+		usr$x <- plt$x*(cusr[2]-cusr[1])+cusr[1]
+		usr$y <- plt$y*(cusr[4]-cusr[3])+cusr[3]
 
-    tdev <- list()
-    tdev$x <- dev$x*(cdev[2]-cdev[1])+cdev[1]
-    tdev$y <- dev$y*(cdev[4]-cdev[3])+cdev[3]
+		tdev <- list()
+		tdev$x <- dev$x*(cdev[2]-cdev[1])+cdev[1]
+		tdev$y <- dev$y*(cdev[4]-cdev[3])+cdev[3]
 
-    return( list( usr=usr, plt=plt, fig=fig, dev=dev, tdev=tdev ) )
-  }
+		return( list( usr=usr, plt=plt, fig=fig, dev=dev, tdev=tdev ) )
+	}
 
-  if(input=='tdev'){
-    tdev <- xy
+	if(input=='tdev'){
+		tdev <- xy
 
-    dev <- list()
-    dev$x <- (tdev$x-cdev[1])/(cdev[2]-cdev[1])
-    dev$y <- (tdev$y-cdev[3])/(cdev[4]-cdev[3])
+		dev <- list()
+		dev$x <- (tdev$x-cdev[1])/(cdev[2]-cdev[1])
+		dev$y <- (tdev$y-cdev[3])/(cdev[4]-cdev[3])
 
-    fig <- list()
-    fig$x <- (dev$x-cfig[1])/(cfig[2]-cfig[1])
-    fig$y <- (dev$y-cfig[3])/(cfig[4]-cfig[3])
+		fig <- list()
+		fig$x <- (dev$x-cfig[1])/(cfig[2]-cfig[1])
+		fig$y <- (dev$y-cfig[3])/(cfig[4]-cfig[3])
 
-    plt <- list()
-    plt$x <- (fig$x-cplt[1])/(cplt[2]-cplt[1])
-    plt$y <- (fig$y-cplt[3])/(cplt[4]-cplt[3])
+		plt <- list()
+		plt$x <- (fig$x-cplt[1])/(cplt[2]-cplt[1])
+		plt$y <- (fig$y-cplt[3])/(cplt[4]-cplt[3])
 
-    usr <- list()
-    usr$x <- plt$x*(cusr[2]-cusr[1])+cusr[1]
-    usr$y <- plt$y*(cusr[4]-cusr[3])+cusr[3]
+		usr <- list()
+		usr$x <- plt$x*(cusr[2]-cusr[1])+cusr[1]
+		usr$y <- plt$y*(cusr[4]-cusr[3])+cusr[3]
 
-    tdev <- list()
-    tdev$x <- dev$x*(cdev[2]-cdev[1])+cdev[1]
-    tdev$y <- dev$y*(cdev[4]-cdev[3])+cdev[3]
+		tdev <- list()
+		tdev$x <- dev$x*(cdev[2]-cdev[1])+cdev[1]
+		tdev$y <- dev$y*(cdev[4]-cdev[3])+cdev[3]
 
-    return( list( usr=usr, plt=plt, fig=fig, dev=dev, tdev=tdev ) )
-  }
+		return( list( usr=usr, plt=plt, fig=fig, dev=dev, tdev=tdev ) )
+	}
 
 }
 
 subplot <- function(fun, x, y=NULL, size=c(1,1), vadj=0.5, hadj=0.5,
-                    inset=c(0,0), type=c('plt','fig'), pars=NULL){
+					inset=c(0,0), type=c('plt','fig'), pars=NULL){
 
-  old.par <- par(no.readonly=TRUE)
-  on.exit(par(old.par))
+	old.par <- par(no.readonly=TRUE)
+	on.exit(par(old.par))
 
-  type <- match.arg(type)
+	type <- match.arg(type)
 
-  if(missing(x)) x <- locator(2)
+	if(missing(x)) x <- locator(2)
 
-  if(is.character(x)) {
-      if(length(inset) == 1) inset <- rep(inset,2)
-      x.char <- x
-      tmp <- par('usr')
-      x <- (tmp[1]+tmp[2])/2
-      y <- (tmp[3]+tmp[4])/2
+	if(is.character(x)) {
+		if(length(inset) == 1) inset <- rep(inset,2)
+		x.char <- x
+		tmp <- par('usr')
+		x <- (tmp[1]+tmp[2])/2
+		y <- (tmp[3]+tmp[4])/2
 
-      if( length(grep('left',x.char, ignore.case=TRUE))) {
-          x <- tmp[1] + inset[1]*(tmp[2]-tmp[1])
-          if(missing(hadj)) hadj <- 0
-      }
-      if( length(grep('right',x.char, ignore.case=TRUE))) {
-          x <- tmp[2] - inset[1]*(tmp[2]-tmp[1])
-          if(missing(hadj)) hadj <- 1
-      }
-      if( length(grep('top',x.char, ignore.case=TRUE))) {
-          y <- tmp[4] - inset[2]*(tmp[4]-tmp[3])
-          if(missing(vadj)) vadj <- 1
-      }
-      if( length(grep('bottom',x.char, ignore.case=TRUE))) {
-          y <- tmp[3] + inset[2]*(tmp[4]-tmp[3])
-          if(missing(vadj)) vadj <- 0
-      }
-  }
+		if( length(grep('left',x.char, ignore.case=TRUE))) {
+			x <- tmp[1] + inset[1]*(tmp[2]-tmp[1])
+			if(missing(hadj)) hadj <- 0
+		}
+		if( length(grep('right',x.char, ignore.case=TRUE))) {
+			x <- tmp[2] - inset[1]*(tmp[2]-tmp[1])
+			if(missing(hadj)) hadj <- 1
+		}
+		if( length(grep('top',x.char, ignore.case=TRUE))) {
+			y <- tmp[4] - inset[2]*(tmp[4]-tmp[3])
+			if(missing(vadj)) vadj <- 1
+		}
+		if( length(grep('bottom',x.char, ignore.case=TRUE))) {
+			y <- tmp[3] + inset[2]*(tmp[4]-tmp[3])
+			if(missing(vadj)) vadj <- 0
+		}
+	}
 
-  xy <- xy.coords(x,y)
+	xy <- xy.coords(x,y)
 
-  if(length(xy$x) != 2){
-    pin <- par('pin')
-    tmp <- cnvrt.coords(xy$x[1],xy$y[1],'usr')$plt
+	if(length(xy$x) != 2){
+	pin <- par('pin')
+	tmp <- cnvrt.coords(xy$x[1],xy$y[1],'usr')$plt
 
-    x <- c( tmp$x - hadj*size[1]/pin[1],
-            tmp$x + (1-hadj)*size[1]/pin[1] )
-    y <- c( tmp$y - vadj*size[2]/pin[2],
-            tmp$y + (1-vadj)*size[2]/pin[2] )
+	x <- c( tmp$x - hadj*size[1]/pin[1],
+			tmp$x + (1-hadj)*size[1]/pin[1] )
+	y <- c( tmp$y - vadj*size[2]/pin[2],
+			tmp$y + (1-vadj)*size[2]/pin[2] )
 
-    xy <- cnvrt.coords(x,y,'plt')$fig
-  } else {
-    xy <- cnvrt.coords(xy,,'usr')$fig
-  }
+	xy <- cnvrt.coords(x,y,'plt')$fig
+	} else {
+	xy <- cnvrt.coords(xy,,'usr')$fig
+	}
 
-  par(pars)
-  if(type=='fig'){
-      par(fig=c(xy$x,xy$y), new=TRUE)
-  } else {
-      par(plt=c(xy$x,xy$y), new=TRUE)
-  }
-  fun
-  tmp.par <- par(no.readonly=TRUE)
+	par(pars)
+	if(type=='fig'){
+		par(fig=c(xy$x,xy$y), new=TRUE)
+	} else {
+		par(plt=c(xy$x,xy$y), new=TRUE)
+	}
+	fun
+	tmp.par <- par(no.readonly=TRUE)
 
-  return(invisible(tmp.par))
+	return(invisible(tmp.par))
 }
 
 
 SPADE.plot.trees <- function(graph, files, file_pattern="*anno.Rsave", out_dir=".", layout=SPADE.layout.arch, attr_pattern="percent|medians|fold|cvs", scale=NULL, pctile_color=c(0.02,0.98), normalize="global",size_scale_factor=1, edge.color="grey", bare=FALSE, palette="bluered") {
 	if (!is.igraph(graph)) {
 		stop("Not a graph object")
-    }	
+	}	
 	if (!is.null(scale) && (!is.vector(scale) || length(scale) !=2)) {
 		stop("scale must be a two element vector")
 	}
@@ -410,7 +494,7 @@ SPADE.plot.trees <- function(graph, files, file_pattern="*anno.Rsave", out_dir="
 
 	if (length(files) == 1 && file.info(SPADE.strip.sep(files))$isdir) {
 		files <- dir(SPADE.strip.sep(files),full.names=TRUE,pattern=glob2rx(file_pattern))    
-  }
+	}
 	out_dir <- SPADE.normalize.out_dir(out_dir)
 
 	load_attr <- function(save_file) {
@@ -444,15 +528,15 @@ SPADE.plot.trees <- function(graph, files, file_pattern="*anno.Rsave", out_dir="
 	
 	if (palette == "jet")
 		palette <- colorRampPalette(c("#00007F", "blue", "#007FFF", "cyan", "#7FFF7F", "yellow", "#FF7F00", "red", "#7F0000"))
-    else
-    	if (palette == "bluered")
-    		palette <- colorRampPalette(c("blue", "#007FFF", "cyan", "#7FFF7F", "yellow", "#FF7F00", "red"))
-     	else
-     		stop("Please use a supported color palette.  Options are 'bluered' or 'jet'")    	
-    	
-    colorscale <- palette(100)
+	else
+		if (palette == "bluered")
+			palette <- colorRampPalette(c("blue", "#007FFF", "cyan", "#7FFF7F", "yellow", "#FF7F00", "red"))
+		else
+			stop("Please use a supported color palette.  Options are 'bluered' or 'jet'")    	
+		
+	colorscale <- palette(100)
 
-    for (f in files) {
+	for (f in files) {
 		attrs <- load_attr(f)
 	
 		vsize <- attrs$percenttotal
@@ -496,7 +580,7 @@ SPADE.plot.trees <- function(graph, files, file_pattern="*anno.Rsave", out_dir="
 
 			# Plot the tree, with legend showing the gradient
 			pdf(paste(out_dir,basename(f),".",name,".pdf",sep=""))
-	    graph_aspect <- ((max(graph_l[,2])-min(graph_l[,2]))/(max(graph_l[,1])-min(graph_l[,1])))
+			graph_aspect <- ((max(graph_l[,2])-min(graph_l[,2]))/(max(graph_l[,1])-min(graph_l[,1])))
 			plot(graph, layout=graph_l, vertex.shape="circle", vertex.color=fill_color, vertex.frame.color=frame_color, edge.color=edge.color, vertex.size=vsize, vertex.label=NA, edge.arrow.size=.25, edge.arrow.width=1, asp=graph_aspect) 
 
 			if (!bare) {			
@@ -528,6 +612,57 @@ SPADE.plot.trees <- function(graph, files, file_pattern="*anno.Rsave", out_dir="
 			}
 			dev.off()
 		}
-    }
+	}
 }
 
+SPADE.createPopulationMapping <- function(fcsFile, ruleDir, fcs_channel_mapping){
+	cat(paste("Processing FCS file:",fcsFile,"\n",sep=" "))
+	#Read FCS file
+	fcs = SPADE.read.FCS(paste(fcsFile,sep=""))
+
+	#Extract column names as a vector
+	params <- parameters(fcs);
+	pd     <- pData(params);
+	fcsColumns = as.vector(pd$name)
+
+	#Walk through FCS file and create proteinName --> columnNumber map
+	columnNumber = 0
+	proteinToColumnNumber <- new.env()
+	for(channelName in fcsColumns) {
+		columnNumber = columnNumber + 1
+		if (fcs_channel_mapping[channelName] != "NULL" && fcs_channel_mapping[channelName] != "-") {
+			proteinName = fcs_channel_mapping[[channelName]]
+			cat(paste("Found channelName to protein mapping:", channelName, proteinName, columnNumber, "\n", sep=" " ))
+			proteinToColumnNumber[[proteinName]] = columnNumber
+		}
+	}
+
+	population_mapping_rules = hash()
+	ruleDir = system.file(paste("tools","PopulationRules","",sep=.Platform$file.sep),package="spade")
+	for (filename in list.files(ruleDir,"*.txt")) {
+		rules = read.table(paste(ruleDir,filename,sep=""), col.names=c("channel","hilo","protein"))
+		cat(paste("Processing rule:", ruleDir, filename, "\n", sep=" " ))
+
+		#Initialize a new vector -- there may be a more elegant way of doing this.
+		ruleTranslation = as.vector("")
+		for (protein in as.array(rules$protein)) {
+			if (length(proteinToColumnNumber[[protein]]) > 0 && proteinToColumnNumber[[protein]] != "NULL")	{
+				fcsColumnNumber = proteinToColumnNumber[[protein]]
+				ruleTranslation = append(ruleTranslation, fcsColumnNumber)
+			} else {
+				ruleTranslation = as.vector("")
+				cat(paste("protein ", protein, " not found."))
+				cat(paste("Cannot process rule:", ruleDir, filename, "\n", sep=" " ))
+				break; #Cannot process this rule file
+			}
+		}
+		
+		ruleTranslation = ruleTranslation[-1]
+		if (length(ruleTranslation) > 0) {
+			cat(paste("Successfully processed rule:", ruleDir, filename, "\n", sep=" " ))
+			population_mapping_rules[[filename]] = as.numeric(ruleTranslation)
+		}
+	}
+
+	population_mapping_rules
+}
