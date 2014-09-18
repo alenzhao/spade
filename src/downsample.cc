@@ -61,8 +61,8 @@ namespace {
 		std::nth_element(min_dists, min_dists+num_samples/2, min_dists+num_samples);
 		Dist_t median_min_dist = min_dists[num_samples/2];
 	
-		delete idxs;
-		delete min_dists;
+		delete[] idxs;
+		delete[] min_dists;
 	
 		return median_min_dist;
 	}
