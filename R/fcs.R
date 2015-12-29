@@ -1,8 +1,8 @@
 SPADE.read.FCS <- function(file, comp=TRUE, verbose=FALSE, ...) {
 	if (verbose)
-		fcs <- read.FCS(file, ...)
+		fcs <- read.FCS(file, emptyValue=FALSE, ...)
 	else 
-		fcs <- suppressWarnings(read.FCS(file, ...))
+		fcs <- suppressWarnings(read.FCS(file, emptyValue=FALSE, ...))
 	
 	params <- parameters(fcs)
 	pd     <- pData(params)
